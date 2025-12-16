@@ -1,0 +1,107 @@
+name: RDP + Tailscale with Data Autosave
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      runtime_minutes:
+        description: "Runtime minutes"
+        default: "355"
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: ${{ secrets.RDP_USER }}
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+
+    steps:
+    # 🔹 1) RESTORE AUTOSAVED DATA (FIRST RUN SAFE)
+    - name: Restore autosaved data
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: autosave-data
+        path: D:\sourab
+
+    # 🔹 2) ENSURE AUTOSAVE FOLDER
+    - name: Prepare autosave folder
+      run: |
+        New-Item -ItemType Directory -Force -Path D:\sourab
+        Write-Host "Autosave folder ready: D:\sourab"
+
+    # 🔹 3) INSTALL & CONNECT TAILSCALE
+    - name: Install & Connect Tailscale
+      run: |
+        $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
+        if(-not(Test-Path $ts)){
+          $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $dst="$env:TEMP\tailscale.msi"
+          Invoke-WebRequest $url -OutFile $dst
+          Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+        }
+        & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-rdp"
+        $ip=& $ts ip -4 | Select-Object -First 1
+        Write-Host "TAILSCALE IP: $ip"
+
+    # 🔹 4) ENABLE RDP (BEST EFFORT)
+    - name: Enable RDP
+      run: |
+        $u=$env:RDP_USER
+        $p=$env:RDP_PASS
+        $s=ConvertTo-SecureString $p -AsPlainText -Force
+
+        if(-not(Get-LocalUser -Name $u -ErrorAction SilentlyContinue)){
+          New-LocalUser -Name $u -Password $s -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $u
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+        }
+
+        Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+          -Name fDenyTSConnections -Value 0
+
+        Set-NetFirewallRule -DisplayGroup "Remote Desktop" -Profile Any -Enabled True
+
+        # Disable NLA (helps in some cases)
+        Set-ItemProperty `
+          "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+          -Name UserAuthentication -Value 0
+
+        Restart-Service TermService -Force
+        Write-Host "RDP configured (best effort)"
+
+    # 🔹 5) KEEP JOB ALIVE
+    - name: Keep alive
+      run: |
+        $end=(Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
+        while((Get-Date) -lt $end){
+          Write-Host ("Running at "+(Get-Date))
+          Start-Sleep 60
+        }
+
+    # 🔹 6) AUTOSAVE DATA (ALWAYS)
+    - name: Autosave data
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: autosave-data
+        path: D:\sourab
+        retention-days: 7
