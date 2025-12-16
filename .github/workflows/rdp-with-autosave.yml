@@ -1,4 +1,4 @@
-name: RDP + Tailscale with Data Autosave
+name: RDP + Tailscale with Data Autosave (SAFE)
 
 on:
   workflow_dispatch:
@@ -29,14 +29,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
 
-    env:
-      RDP_USER: ${{ secrets.RDP_USER }}
-      RDP_PASS: ${{ secrets.RDP_PASS }}
-
     steps:
-    # ===============================
-    # 1️⃣ RESTORE AUTOSAVED DATA
-    # ===============================
+    # 1️⃣ Restore autosaved data
     - name: Restore autosaved data
       uses: actions/download-artifact@v4
       continue-on-error: true
@@ -44,17 +38,13 @@ jobs:
         name: autosave-data
         path: D:\sourab
 
-    # ===============================
-    # 2️⃣ PREPARE AUTOSAVE FOLDER
-    # ===============================
+    # 2️⃣ Prepare autosave folder
     - name: Prepare autosave folder
       run: |
         New-Item -ItemType Directory -Force -Path D:\sourab
-        Write-Host "Autosave folder ready: D:\sourab"
+        Write-Host "Autosave folder ready"
 
-    # ===============================
-    # 3️⃣ INSTALL & CONNECT TAILSCALE
-    # ===============================
+    # 3️⃣ Install & connect Tailscale
     - name: Install & Connect Tailscale
       run: |
         $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -65,45 +55,29 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
         }
         & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet-rdp"
-        $ip = & $ts ip -4 | Select-Object -First 1
-        Write-Host "TAILSCALE IP: $ip"
+        & $ts ip -4
 
-    # ===============================
-    # 4️⃣ ENABLE RDP (NON-BLOCKING)
-    # ===============================
-    - name: Enable RDP (safe)
+    # 4️⃣ Enable RDP (NO user creation)
+    - name: Enable RDP (system only)
       run: |
-        $u = $env:RDP_USER
-        $p = $env:RDP_PASS
-        $s = ConvertTo-SecureString $p -AsPlainText -Force
-
         try {
-          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $s -AccountNeverExpires -ErrorAction Stop
-            Add-LocalGroupMember -Group "Administrators" -Member $u
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
-            Write-Host "RDP user created"
-          }
-          else {
-            Write-Host "RDP user already exists"
-          }
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Set-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -Profile Any `
+            -Enabled True
+
+          Restart-Service TermService -Force
+          Write-Host "RDP enabled (system level)"
         }
         catch {
-          Write-Host "⚠️ RDP user creation skipped: $($_.Exception.Message)"
+          Write-Host "⚠️ RDP enable skipped: $($_.Exception.Message)"
         }
 
-        Set-ItemProperty `
-          "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-          -Name fDenyTSConnections -Value 0
-
-        Set-NetFirewallRule -DisplayGroup "Remote Desktop" -Profile Any -Enabled True
-
-        Restart-Service TermService -Force
-        Write-Host "RDP step finished (best effort)"
-
-    # ===============================
-    # 5️⃣ KEEP JOB ALIVE
-    # ===============================
+    # 5️⃣ Keep alive
     - name: Keep alive
       run: |
         $end = (Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
@@ -112,9 +86,7 @@ jobs:
           Start-Sleep 60
         }
 
-    # ===============================
-    # 6️⃣ AUTOSAVE DATA (ALWAYS)
-    # ===============================
+    # 6️⃣ Autosave data
     - name: Autosave data
       if: always()
       uses: actions/upload-artifact@v4
