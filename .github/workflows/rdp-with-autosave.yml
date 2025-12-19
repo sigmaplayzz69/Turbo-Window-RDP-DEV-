@@ -85,19 +85,7 @@ jobs:
 
           Write-Host "RDP ready → User: $u | IP: $env:TAILSCALE_IP"
 
-      - name: Create D:\sourab autosave folder
-        run: |
-          if (Test-Path "D:\") {
-            if (-not (Test-Path "D:\sourab")) {
-              New-Item -ItemType Directory -Path "D:\sourab" | Out-Null
-              Write-Host "✅ D:\sourab folder created"
-            } else {
-              Write-Host "ℹ️ D:\sourab already exists"
-            }
-          } else {
-            Write-Host "❌ D drive not found"
-          }
-
+      
       - name: Install Python libs
         run: |
           python -m pip install --upgrade pip
