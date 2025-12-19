@@ -1,74 +1,113 @@
-name: RDP + Tailscale (Workflow 2)
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      ts_tailnet:      { description: "Tailscale tailnet", required: true }
-      ts_api_key:      { description: "Tailscale API key", required: true }
-      ts_authkey:      { description: "Tailscale Auth key", required: true }
-      quick_test:      { description: "Run 5-min test", type: boolean, default: false }
-      runtime_minutes: { description: "Runtime", required: false, default: "355" }
-      do_purge:        { description: "Purge bullet devices", required: false, default: "true" }
-      rdp_count:       { description: "RDP count", required: false, default: "1" }
-      cycles_left:     { description: "Cycles remaining", required: true }
-
-permissions:
-  contents: read
-  actions: write
-
-defaults:
-  run:
-    shell: pwsh
 
 jobs:
-  run-rdp:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 370
-    env:
-      RDP_USER: Bullettemporary
-      RDP_PASS: Bullet@12345
+    timeout-minutes: 3600
 
     steps:
-      - name: Setup Tailscale + RDP
+      - name: Configure Core RDP Settings
         run: |
-          $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
-          if(-not(Test-Path $ts)){
-            $url="https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-            $dst="$env:TEMP\tailscale.msi"
-            Invoke-WebRequest $url -OutFile $dst
-            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet2" --accept-dns=true
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-      - name: Install Python libs
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --force-reinstall pyautogui pynput pillow
-
-      - name: Keep alive
-        run: |
-          $rt=[int]"${{ inputs.runtime_minutes }}"
-          $end=(Get-Date).AddMinutes($rt)
-          while((Get-Date) -lt $end){Write-Host ("Workflow2 heartbeat "+(Get-Date));Start-Sleep 60}
-
-      - name: Dispatch STOP workflow
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $payload=@{
-            ts_tailnet="${{ inputs.ts_tailnet }}"
-            ts_api_key="${{ inputs.ts_api_key }}"
-            ts_authkey="${{ inputs.ts_authkey }}"
-            quick_test="${{ inputs.quick_test }}"
-            runtime_minutes="${{ inputs.runtime_minutes }}"
-            do_purge="${{ inputs.do_purge }}"
-            rdp_count="${{ inputs.rdp_count }}"
-            cycles_left="${{ inputs.cycles_left }}"
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
-          $url="https://api.github.com/repos/${{ github.repository }}/actions/workflows/workflow-stop.yml/dispatches"
-          $hdr=@{Authorization="Bearer $env:GH_TOKEN";Accept="application/vnd.github+json"}
-          $body=@{ref="${{ github.ref_name }}";inputs=$payload}|ConvertTo-Json -Depth 20
-          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body|Out-Null
-          Write-Host "🛑 STOP workflow triggered (cycles left: ${{ inputs.cycles_left }})"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
