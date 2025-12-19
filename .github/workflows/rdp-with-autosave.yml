@@ -42,8 +42,8 @@ jobs:
     timeout-minutes: 370
 
     env:
-      RDP_USER: sourab
-      RDP_PASS: sourab@12345
+      RDP_USER: bullettemporary 
+      RDP_PASS: Bullet@12345
 
     steps:
       - name: Decide runtime
