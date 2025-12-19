@@ -3,42 +3,14 @@ name: RDP + Tailscale (Workflow 1)
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
-        required: true
-
-      ts_api_key:
-        description: "Tailscale API key (device admin, no Bearer)"
-        required: true
-
-      ts_authkey:
-        description: "Tailscale Auth key"
-        required: true
-
-      quick_test:
-        description: "Run 5-minute test"
-        type: boolean
-        default: false
-
-      runtime_minutes:
-        description: "Runtime minutes"
-        required: false
-        default: "450"
-
-      do_purge:
-        description: "Purge bullet* devices"
-        required: false
-        default: "true"
-
-      rdp_count:
-        description: "RDP instance count (1-10)"
-        required: false
-        default: "1"
-
-      cycles_left:
-        description: "Number of full cycles remaining"
-        required: false
-        default: "5"
+      ts_tailnet:      { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
+      ts_api_key:      { description: "Tailscale API key (device admin, no Bearer)", required: true }
+      ts_authkey:      { description: "Tailscale Auth key", required: true }
+      quick_test:      { description: "Run 5-minute test", type: boolean, default: false }
+      runtime_minutes: { description: "Runtime minutes", required: false, default: "355" }
+      do_purge:        { description: "Purge bullet* devices", required: false, default: "true" }
+      rdp_count:       { description: "RDP instance count (1-10)", required: false, default: "1" }
+      cycles_left:     { description: "Number of full cycles remaining", required: false, default: "5" }
 
 permissions:
   contents: read
@@ -50,6 +22,156 @@ defaults:
 
 jobs:
   setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        name: Make matrix for RDP instances
+        run: |
+          $n = [int]"${{ inputs.rdp_count }}"
+          if ($n -lt 1) { $n = 1 }
+          if ($n -gt 10) { $n = 10 }
+          $arr = @()
+          for ($i = 1; $i -le $n; $i++) { $arr += @{ id = $i } }
+          $json = @{ include = $arr } | ConvertTo-Json -Compress
+          "matrix=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    timeout-minutes: 370
+
+    env:
+      RDP_USER: sourab
+      RDP_PASS: sourab@12345
+
+    steps:
+      - name: Decide runtime
+        run: |
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          $rt = if (Yes("${{ inputs.quick_test }}")) { 5 } else { [int]"${{ inputs.runtime_minutes }}" }
+          if ($rt -gt 360) { $rt = 355 }
+          "RUNTIME_MINUTES=$rt" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Runtime set to $rt minutes"
+
+      - name: Install + Configure Tailscale
+        run: |
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = Join-Path $env:TEMP "tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
+          }
+
+          # Start tailscale using the provided authkey
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "sourab-rdp" --accept-dns=true
+
+          # Capture a single IPv4 address and export to subsequent steps
+          $ip = (& $ts ip -4 | Select-Object -First 1).ToString().Trim()
+          if ($ip) {
+            "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "Tailscale IPv4: $ip"
+          } else {
+            Write-Host "Warning: could not determine Tailscale IPv4 address"
+          }
+
+      - name: Enable RDP
+        run: |
+          $u = $env:RDP_USER
+          $p = $env:RDP_PASS
+          $s = ConvertTo-SecureString $p -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $s -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          }
+
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP ready → User: $u | IP: $env:TAILSCALE_IP"
+
+      - name: Create D:\sourab autosave folder
+        run: |
+          if (Test-Path "D:\") {
+            if (-not (Test-Path "D:\sourab")) {
+              New-Item -ItemType Directory -Path "D:\sourab" | Out-Null
+              Write-Host "✅ D:\sourab folder created"
+            } else {
+              Write-Host "ℹ️ D:\sourab already exists"
+            }
+          } else {
+            Write-Host "❌ D drive not found"
+          }
+
+      - name: Install Python libs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --force-reinstall pyautogui pynput pillow
+
+      - name: Keep alive
+        run: |
+          # Read the runtime that was written to $GITHUB_ENV in an earlier step
+          $minutes = [int]$env:RUNTIME_MINUTES
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host ("Workflow heartbeat " + (Get-Date))
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Dispatch Workflow 2
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Decrement cycles_left (use the input directly)
+          $next = [int]"${{ inputs.cycles_left }}" - 1
+          $payload = @{
+            ts_tailnet      = "${{ inputs.ts_tailnet }}"
+            ts_api_key      = "${{ inputs.ts_api_key }}"
+            ts_authkey      = "${{ inputs.ts_authkey }}"
+            quick_test      = "${{ inputs.quick_test }}"
+            runtime_minutes = "${{ inputs.runtime_minutes }}"
+            do_purge        = "${{ inputs.do_purge }}"
+            rdp_count       = "${{ inputs.rdp_count }}"
+            cycles_left     = "$next"
+          }
+
+          $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/workflow-2.yml/dispatches"
+          $hdr = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept        = "application/vnd.github+json"
+            "Content-Type"= "application/json"
+          }
+          $body = @{ ref = "${{ github.ref_name }}" ; inputs = $payload } | ConvertTo-Json -Depth 20
+
+          try {
+            Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+            Write-Host "➡️ Workflow 2 triggered. Cycles left: $next"
+          } catch {
+            Write-Host "❌ Failed to dispatch Workflow 2: $($_.Exception.Message)"
+            throw
+          }
+           cycles_left:
+        description: "Number of full cycles remaining"
+        required: false
+        default: "5"
+
+        permissions:
+         contents: read
+         actions: write
+
+         defaults:
+          run:
+           shell: pwsh
+
+           jobs: 
+setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
@@ -69,9 +191,9 @@ jobs:
           $json=@{include=$arr}|ConvertTo-Json -Compress
           "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append
 
-  rdp:
-    needs: setup
-    runs-on: windows-2022
+            rdp:
+            needs: setup
+            runs-on: windows-2022
 
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
@@ -82,7 +204,7 @@ jobs:
       RDP_USER: sourab
       RDP_PASS: sourab@12345
 
-    steps:
+      steps:
       - name: Decide runtime
         run: |
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
@@ -135,19 +257,19 @@ jobs:
 
 
           - name: Create D drive sourab folder
-  run: |
-    if (!(Test-Path "D:\sourab")) {
-      New-Item -ItemType Directory -Path "D:\sourab"
-    }
-    Write-Host "D:\sourab ready"
+      run: |
+        if (!(Test-Path "D:\sourab")) {
+        New-Item -ItemType Directory -Path "D:\sourab"
+        }
+          Write-Host "D:\sourab ready"
 
 
-      - name: Install Python libs
+         - name: Install Python libs
         run: |
           python -m pip install --upgrade pip
           python -m pip install --force-reinstall pyautogui pynput pillow
 
-      - name: Keep alive
+        - name: Keep alive
         run: |
           $end=(Get-Date).AddMinutes([int]"${{ env.RUNTIME_MINUTES }}")
           while((Get-Date) -lt $end){
@@ -155,11 +277,11 @@ jobs:
             Start-Sleep 60
           }
 
-      - name: Dispatch Workflow 2
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+        - name: Dispatch Workflow 2
+      if: always() 
+      env:
+         GH_TOKEN: ${{ github.token }}
+          run: |
           $next=[int]"${{ inputs.cycles_left }}" - 1
 
           $payload=@{
